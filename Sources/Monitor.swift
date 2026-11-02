@@ -3,7 +3,7 @@ import SwiftUI
 import Combine
 
 enum ListTab: String, CaseIterable, Identifiable {
-    case cpu, memory, disk, network, history, dev, clean
+    case cpu, memory, disk, network, energy, history, dev, clean
 
     var id: String { rawValue }
 
@@ -13,6 +13,7 @@ enum ListTab: String, CaseIterable, Identifiable {
         case .memory: "Memory"
         case .disk: "Disk"
         case .network: "Network"
+        case .energy: "Energy"
         case .history: "History"
         case .dev: "Dev"
         case .clean: "Clean"
@@ -22,32 +23,157 @@ enum ListTab: String, CaseIterable, Identifiable {
     var isProcessMetric: Bool { self != .history && self != .dev && self != .clean }
 }
 
-/// A one-minute series (1.5 s samples) plus a one-hour series (averages of 15 samples).
-struct Series {
-    static let minuteLength = 40
-    static let hourLength = 160
-    private static let bucketSize = 15
+enum GraphRange: String, CaseIterable, Identifiable {
+    case m30, h2, h12, d1
 
-    private(set) var minute: [Double] = []
-    private(set) var hour: [Double] = []
-    private var bucket: [Double] = []
+    static let points = 150
 
-    mutating func add(_ value: Double) {
-        minute.append(value)
-        if minute.count > Self.minuteLength { minute.removeFirst() }
-        bucket.append(value)
-        if bucket.count == Self.bucketSize {
-            hour.append(bucket.reduce(0, +) / Double(bucket.count))
-            if hour.count > Self.hourLength { hour.removeFirst() }
-            bucket.removeAll(keepingCapacity: true)
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .m30: "30m"
+        case .h2: "2h"
+        case .h12: "12h"
+        case .d1: "1d"
         }
     }
 
-    func values(long: Bool) -> [Double] { long ? hour : minute }
+    var title: String {
+        switch self {
+        case .m30: "last 30 minutes"
+        case .h2: "last 2 hours"
+        case .h12: "last 12 hours"
+        case .d1: "last day"
+        }
+    }
+
+    /// 150 × bucket × 1.5 s = the window length (12 s, 48 s, 4.8 min and 9.6 min per point).
+    var bucket: Int {
+        switch self {
+        case .m30: 8
+        case .h2: 32
+        case .h12: 192
+        case .d1: 384
+        }
+    }
+
+    var index: Int { Self.allCases.firstIndex(of: self)! }
 }
 
-struct Histories {
+/// One averaged series per history range, fed with 1.5 s samples.
+/// Saved to disk so the long ranges survive restarts; time the app wasn't running is stored as NaN (a gap in the graph).
+struct Series: Codable {
+    private var points = [[Double]](repeating: [], count: GraphRange.allCases.count)
+    private var sums = [Double](repeating: 0, count: GraphRange.allCases.count)
+    private var counts = [Int](repeating: 0, count: GraphRange.allCases.count)
+    /// Per point, the label given with its highest sample, e.g. the app using the most CPU at the peak ("" = none).
+    private var labels = [[String]](repeating: [], count: GraphRange.allCases.count)
+    private var peaks = [Double](repeating: -.infinity, count: GraphRange.allCases.count)
+    private var peakLabels = [String](repeating: "", count: GraphRange.allCases.count)
+
+    mutating func add(_ value: Double, label: String? = nil) {
+        for range in GraphRange.allCases {
+            let i = range.index
+            sums[i] += value
+            counts[i] += 1
+            if let label, value >= peaks[i] {
+                peaks[i] = value
+                peakLabels[i] = label
+            }
+            guard counts[i] == range.bucket else { continue }
+            append(sums[i] / Double(counts[i]), label: peakLabels[i], at: i)
+            resetBucket(i)
+        }
+    }
+
+    private mutating func append(_ value: Double, label: String, at i: Int) {
+        points[i].append(value)
+        labels[i].append(label)
+        if points[i].count > GraphRange.points {
+            points[i].removeFirst(points[i].count - GraphRange.points)
+        }
+        if labels[i].count > points[i].count { labels[i].removeFirst(labels[i].count - points[i].count) }
+    }
+
+    private mutating func resetBucket(_ i: Int) {
+        sums[i] = 0
+        counts[i] = 0
+        peaks[i] = -.infinity
+        peakLabels[i] = ""
+    }
+
+    /// Accounts for time the app wasn't sampling: whole missing points become NaN gaps and the partial bucket is dropped.
+    mutating func skip(seconds: Double) {
+        for range in GraphRange.allCases {
+            let i = range.index
+            let missing = Int(seconds / (Double(range.bucket) * 1.5))
+            guard missing > 0 else { continue }
+            for _ in 0..<min(missing, GraphRange.points) { append(.nan, label: "", at: i) }
+            resetBucket(i)
+        }
+    }
+
+    /// Completed points plus the bucket still filling, so the newest point moves live.
+    func values(_ range: GraphRange) -> [Double] {
+        let i = range.index
+        guard counts[i] > 0 else { return points[i] }
+        return Array((points[i] + [sums[i] / Double(counts[i])]).suffix(GraphRange.points))
+    }
+
+    /// Labels aligned one-to-one with `values(range)`.
+    func labels(_ range: GraphRange) -> [String] {
+        let i = range.index
+        var result = labels[i]
+        if result.count < points[i].count { result.insert(contentsOf: Array(repeating: "", count: points[i].count - result.count), at: 0) }
+        guard counts[i] > 0 else { return result }
+        return Array((result + [peakLabels[i]]).suffix(GraphRange.points))
+    }
+}
+
+struct Histories: Codable {
     var cpu = Series(), gpu = Series(), memory = Series(), swap = Series(), io = Series(), network = Series()
+
+    /// Next to the 7-day history database. Builds before the merge kept it in "Glass Monitor/history.json"; move it once.
+    private static var file: URL {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = support.appendingPathComponent("GlassMonitor", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("graphs.json")
+        let legacyDir = support.appendingPathComponent("Glass Monitor", isDirectory: true)
+        let legacy = legacyDir.appendingPathComponent("history.json")
+        if !FileManager.default.fileExists(atPath: file.path), FileManager.default.fileExists(atPath: legacy.path) {
+            try? FileManager.default.moveItem(at: legacy, to: file)
+            try? FileManager.default.removeItem(at: legacyDir)
+        }
+        return file
+    }
+
+    private struct Saved: Codable {
+        let savedAt: Date
+        let histories: Histories
+    }
+
+    func save() {
+        let encoder = JSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: "inf", negativeInfinity: "-inf", nan: "nan")
+        guard let data = try? encoder.encode(Saved(savedAt: Date(), histories: self)) else { return }
+        try? data.write(to: Self.file, options: .atomic)
+    }
+
+    /// The saved history, with the time since it was saved turned into gaps.
+    static func load() -> Histories {
+        let decoder = JSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "inf", negativeInfinity: "-inf", nan: "nan")
+        guard let data = try? Data(contentsOf: file),
+              let saved = try? decoder.decode(Saved.self, from: data) else { return Histories() }
+        var h = saved.histories
+        let gap = max(Date().timeIntervalSince(saved.savedAt), 0)
+        for path in [\Histories.cpu, \.gpu, \.memory, \.swap, \.io, \.network] as [WritableKeyPath<Histories, Series>] {
+            h[keyPath: path].skip(seconds: gap)
+        }
+        return h
+    }
 }
 
 final class Monitor: ObservableObject {
@@ -60,6 +186,7 @@ final class Monitor: ObservableObject {
     var onDrag: (() -> Void)?
     var onDragEnd: (() -> Void)?
     var onSnapToCorner: (() -> Void)?
+    var onShutDown: (() -> Void)?
     var onAlert: ((MonitorAlert) -> Void)?
 
     @Published var screenName = UserDefaults.standard.string(forKey: "screenName") {
@@ -87,7 +214,13 @@ final class Monitor: ObservableObject {
     @Published private(set) var writeRate = 0.0
     @Published private(set) var netIn = 0.0
     @Published private(set) var netOut = 0.0
-    @Published private(set) var history = Histories()
+    @Published private(set) var history = Histories.load()
+    /// Glass Monitor's own CPU (share of one core, helpers included) and memory footprint.
+    @Published private(set) var selfCPU = 0.0
+    @Published private(set) var selfMemory: UInt64 = 0
+    /// Read only while the Network tab is open.
+    @Published private(set) var wifi: WiFiInfo?
+    @Published private(set) var wiredIP: String?
 
     // MARK: Panel state
     @Published var expanded = false {
@@ -135,6 +268,13 @@ final class Monitor: ObservableObject {
     private var minute = (cpu: 0.0, memory: 0.0, samples: 0)
     private var lastLaravelScan = Date.distantPast
     private var lastPressureAlert = Date.distantPast
+    private var lastPressureWarning = Date.distantPast
+    private var pressureWarningSince: Date?
+    private var lastDiskAlert = Date.distantPast
+    private var lastSelf: (cpuTime: Double, at: Date)?
+    /// The app using the most CPU / memory in the latest process sample, stored with each graph point.
+    private var cpuCulprit: String?
+    private var memoryCulprit: String?
     /// SMC access is created off the main thread (key discovery takes ≈0.4 s); nil until ready.
     private var smc: SMCSensors?
     private let sensorQueue = DispatchQueue(label: "glassmonitor.sensors", qos: .utility)
@@ -192,7 +332,13 @@ final class Monitor: ObservableObject {
         thermal = ProcessInfo.processInfo.thermalState
         gpu = SystemStats.gpuUtilization()
         // Free space is costly to compute (purgeable space accounting) and changes slowly.
-        if tickCount % 20 == 0 { (diskUsed, diskTotal) = SystemStats.disk() }
+        if tickCount % 20 == 0 {
+            (diskUsed, diskTotal) = SystemStats.disk()
+            checkDiskSpace()
+        }
+        if tickCount % 4 == 0 { measureSelf(now) }
+        if expanded && tab == .network && tickCount % 4 == 2 { readNetwork() }
+        if tickCount % 40 == 39 { history.save() }
         if tickCount % 4 == 0 {
             power = SystemStats.power()
             readSensors()
@@ -216,9 +362,9 @@ final class Monitor: ObservableObject {
         }
         lastNet = net
 
-        history.cpu.add(cpu)
+        history.cpu.add(cpu, label: cpuCulprit)
         history.gpu.add(gpu ?? 0)
-        history.memory.add(memFraction)
+        history.memory.add(memFraction, label: memoryCulprit)
         history.swap.add(swapLevel)
         history.io.add(readRate + writeRate)
         history.network.add(netIn + netOut)
@@ -245,17 +391,45 @@ final class Monitor: ObservableObject {
         case .dev: refreshDev()
         case .clean: if cleanItems.isEmpty { scanClean() }
         case .history: timeline.reload()
+        case .network:
+            readNetwork()
+            sampleProcesses()
         default: sampleProcesses()
         }
     }
 
+    private func measureSelf(_ now: Date) {
+        let usage = SystemStats.selfUsage()
+        selfMemory = usage.memory
+        if let last = lastSelf, usage.cpuTime >= last.cpuTime {
+            selfCPU = (usage.cpuTime - last.cpuTime) / max(now.timeIntervalSince(last.at), 0.1)
+        }
+        lastSelf = (usage.cpuTime, now)
+    }
+
+    private func readNetwork() {
+        guard busy.insert("network").inserted else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let wifi = NetworkInfo.wifi()
+            let wired = wifi == nil ? NetworkInfo.wiredIP(excluding: NetworkInfo.wifiInterfaceName()) : nil
+            DispatchQueue.main.async {
+                self.busy.remove("network")
+                if self.wifi != wifi { self.wifi = wifi }
+                if self.wiredIP != wired { self.wiredIP = wired }
+            }
+        }
+    }
+
+    func saveHistory() { history.save() }
+
     private func sampleProcesses() {
         guard busy.insert("ps").inserted else { return }
-        sampler.sample(network: expanded && tab == .network) { [weak self] list in
+        sampler.sample(network: expanded && tab == .network, energy: expanded && tab == .energy) { [weak self] list in
             guard let self else { return }
             busy.remove("ps")
             processes = list
             updateRows()
+            updateCulprits()
             if prefs.alertsEnabled, let p = runaway.evaluate(list) {
                 raise(MonitorAlert(title: "\(p.appName ?? p.name) is using \(Int(p.cpu))% CPU",
                                    detail: "\(p.name) (PID \(p.id)) has been busy for over 2 minutes",
@@ -289,8 +463,21 @@ final class Monitor: ObservableObject {
         case .memory: Double(x.mem)
         case .disk: x.disk ?? 0
         case .network: x.net ?? 0
+        case .energy: x.energy ?? 0
         default: x.cpu
         }
+    }
+
+    private var appGroups: [AppGroup] {
+        Dictionary(grouping: processes, by: \.groupKey).map { AppGroup(id: $0.key, processes: $0.value) }
+    }
+
+    private func updateCulprits() {
+        let groups = appGroups
+        cpuCulprit = groups.max { $0.metrics.cpu < $1.metrics.cpu }
+            .map { "\($0.name) · \(String(format: "%.0f", $0.metrics.cpu))% CPU" }
+        memoryCulprit = groups.max { $0.metrics.mem < $1.metrics.mem }
+            .map { "\($0.name) · \(bytes(Double($0.metrics.mem)))" }
     }
 
     private func updateRows() {
@@ -406,15 +593,40 @@ final class Monitor: ObservableObject {
     }
 
     private func checkPressure() {
-        guard prefs.alertsEnabled, pressure == .critical, Date().timeIntervalSince(lastPressureAlert) > 600 else { return }
-        lastPressureAlert = Date()
-        let biggest = Dictionary(grouping: processes, by: \.groupKey)
-            .map { AppGroup(id: $0.key, processes: $0.value) }
-            .max { $0.metrics.mem < $1.metrics.mem }
-        raise(MonitorAlert(title: "Memory pressure is critical",
-                           detail: biggest.map { "Biggest: \($0.name) · \(bytes(Double($0.metrics.mem)))" }
-                               ?? "Close some apps to free memory",
-                           pid: nil, processName: nil))
+        let now = Date()
+        pressureWarningSince = pressure == .normal ? nil : (pressureWarningSince ?? now)
+        guard prefs.alertsEnabled else { return }
+        // Only group the process list when an alert actually fires; this runs every tick.
+        func biggestText() -> String? {
+            appGroups.max { $0.metrics.mem < $1.metrics.mem }
+                .map { "Biggest: \($0.name) · \(bytes(Double($0.metrics.mem)))" }
+        }
+
+        if pressure == .critical, now.timeIntervalSince(lastPressureAlert) > 600 {
+            lastPressureAlert = now
+            raise(MonitorAlert(title: "Memory pressure is critical",
+                               detail: biggestText() ?? "Close some apps to free memory",
+                               pid: nil, processName: nil))
+        } else if pressure == .warning, let since = pressureWarningSince, now.timeIntervalSince(since) >= 180,
+                  now.timeIntervalSince(lastPressureWarning) > 3600, now.timeIntervalSince(lastPressureAlert) > 600 {
+            // Earlier heads-up: pressure has stayed at "warning" for 3 minutes (at most once an hour).
+            lastPressureWarning = now
+            let swap = swapUsed > 0 ? " · swap \(bytes(Double(swapUsed)))" : ""
+            raise(MonitorAlert(title: "Memory is getting tight",
+                               detail: (biggestText() ?? "Close some apps to free memory") + swap,
+                               pid: nil, processName: nil))
+        }
+    }
+
+    /// Warns when the startup disk drops below 15 GB free (at most every 6 hours).
+    private func checkDiskSpace() {
+        let free = diskTotal - diskUsed
+        guard prefs.alertsEnabled, diskTotal > 1, free < 15 * 1_073_741_824,
+              Date().timeIntervalSince(lastDiskAlert) > 6 * 3600 else { return }
+        lastDiskAlert = Date()
+        raise(MonitorAlert(title: "Disk almost full · \(bytes(Double(max(free, 0)))) free",
+                           detail: "Clear caches and old project files in the Clean tab",
+                           pid: nil, processName: nil, tab: .clean))
     }
 
     private func raise(_ newAlert: MonitorAlert) {

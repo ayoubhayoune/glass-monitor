@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 enum Columns {
     static let primary: CGFloat = 72
@@ -12,6 +13,7 @@ extension ListTab {
         case .memory: "MEMORY"
         case .disk: "DISK I/O"
         case .network: "NETWORK"
+        case .energy: "ENERGY"
         default: "CPU"
         }
     }
@@ -23,6 +25,7 @@ extension ListTab {
         case .memory: (bytes(Double(x.mem)), Double(x.mem) / Double(memTotal) * 4)
         case .disk: x.disk.map { (rate($0), $0 / 50_000_000) } ?? ("—", 0)
         case .network: x.net.map { (rate($0), $0 / 5_000_000) } ?? ("—", 0)
+        case .energy: x.energy.map { (String(format: "%.1f", $0), $0 / 50) } ?? ("…", 0)
         default: (String(format: "%.1f%%", x.cpu), x.cpu / 100)
         }
     }
@@ -134,6 +137,8 @@ struct ProcessListView: View {
 
     var body: some View {
         VStack(spacing: 4) {
+            if m.tab == .energy { batterySummary }
+            if m.tab == .network { connectionSummary }
             HStack(spacing: 8) {
                 Text(prefs.groupByApp ? "APP" : "PROCESS").frame(maxWidth: .infinity, alignment: .leading)
                 Text(m.tab.primaryTitle).foregroundStyle(.primary).frame(width: Columns.primary, alignment: .trailing)
@@ -155,12 +160,64 @@ struct ProcessListView: View {
             }
             .scrollIndicators(.never)
 
-            if m.tab == .disk || m.tab == .network {
-                Text(m.tab == .disk ? "macOS only reports disk activity for your own processes; others show —"
-                                    : "Per-process traffic measured with nettop")
+            if let note = footnote {
+                Text(note)
                     .font(.system(size: 9.5))
                     .foregroundStyle(.tertiary)
             }
+        }
+    }
+
+    private var footnote: String? {
+        switch m.tab {
+        case .disk: "macOS only reports disk activity for your own processes; others show —"
+        case .network: "Per-process traffic measured with nettop"
+        case .energy: "Energy Impact as reported by macOS, the same figure as Activity Monitor's Energy tab"
+        default: nil
+        }
+    }
+
+    private func summaryStrip(_ symbol: String, _ items: [String]) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: symbol).font(.system(size: 11)).foregroundStyle(.secondary)
+            Text(items.joined(separator: "  ·  ")).font(.system(size: 10.5, weight: .medium)).lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var batterySummary: some View {
+        if let p = m.power {
+            summaryStrip(p.onBattery ? "battery.50percent" : "powerplug.fill", batteryItems(p))
+        } else {
+            summaryStrip("powerplug.fill", ["No battery · energy use per app"])
+        }
+    }
+
+    private func batteryItems(_ p: PowerInfo) -> [String] {
+        var items = [p.percent.map { "\($0)%" } ?? "Battery",
+                     p.onBattery ? String(format: "On battery · %.1f W", p.watts) : (p.charging ? "Charging" : "On power")]
+        if let minutes = p.minutesRemaining {
+            items.append("\(duration(Double(minutes) * 60)) \(p.onBattery ? "left" : "to full")")
+        }
+        if let capacity = m.battery?.maxCapacity { items.append("Health \(capacity)%") }
+        if let cycles = m.battery?.cycles { items.append("\(cycles) cycles") }
+        return items
+    }
+
+    @ViewBuilder
+    private var connectionSummary: some View {
+        if let w = m.wifi {
+            summaryStrip("wifi", [w.ssid ?? "Wi-Fi", "\(w.quality) signal (\(w.rssi) dBm)",
+                                  String(format: "%.0f Mb/s link", w.txRate), w.ip.map { "IP \($0)" } ?? "No IP"])
+        } else if let ip = m.wiredIP {
+            summaryStrip("cable.connector", ["Wired", "IP \(ip)"])
+        } else {
+            summaryStrip("wifi.slash", ["Not connected"])
         }
     }
 
@@ -384,6 +441,25 @@ struct DevView: View {
                 }
             }
             .transition(slideIn)
+        }
+        .contextMenu { portMenu(s, key: key) }
+    }
+
+    /// Right-click: free a port that's "already in use" without hunting for the process.
+    @ViewBuilder
+    private func portMenu(_ s: ListeningServer, key: String) -> some View {
+        let ports = s.ports.map { ":\($0)" }.joined(separator: " ")
+        Button("Free \(ports) — Quit \(s.name)") { m.kill(pid: s.id, name: s.name, force: false, key: key) }
+        Button("Force Kill \(s.name)") { m.kill(pid: s.id, name: s.name, force: true, key: key) }
+        Divider()
+        ForEach(s.ports, id: \.self) { port in
+            Button("Open http://localhost:\(port)") { m.open(port: port) }
+        }
+        ForEach(s.ports, id: \.self) { port in
+            Button("Copy http://localhost:\(port)") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString("http://localhost:\(port)", forType: .string)
+            }
         }
     }
 }

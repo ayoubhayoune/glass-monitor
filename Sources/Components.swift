@@ -28,6 +28,12 @@ func rate(_ b: Double) -> String { bytes(b) + "/s" }
 func percent(_ v: Double) -> String { "\(Int(safe(v * 100).rounded()))%" }
 func gigabytes(_ b: UInt64) -> String { String(format: "%.1fG", Double(b) / 1_073_741_824) }
 
+/// "3h 20m", "45m".
+func duration(_ seconds: Double) -> String {
+    let minutes = Int(safe(seconds) / 60)
+    return minutes >= 60 ? "\(minutes / 60)h \(minutes % 60)m" : "\(minutes)m"
+}
+
 /// Compact form for the pill, e.g. "830K", "1.2M".
 func shortBytes(_ value: Double) -> String {
     let b = safe(value)
@@ -51,15 +57,24 @@ struct Sparkline: Shape {
         guard values.count > 1, capacity > 1 else { return path }
         let step = rect.width / CGFloat(capacity - 1)
         let start = rect.width - step * CGFloat(values.count - 1)
+        // NaN marks time the app wasn't running: draw each run of real samples as its own segment.
+        var segment: [CGPoint] = []
+        func flush() {
+            defer { segment.removeAll() }
+            guard let first = segment.first, let last = segment.last, segment.count > 1 else { return }
+            path.move(to: first)
+            segment.dropFirst().forEach { path.addLine(to: $0) }
+            if closed {
+                path.addLine(to: CGPoint(x: last.x, y: rect.height))
+                path.addLine(to: CGPoint(x: first.x, y: rect.height))
+                path.closeSubpath()
+            }
+        }
         for (i, v) in values.enumerated() {
-            let pt = CGPoint(x: start + step * CGFloat(i), y: rect.height * (1 - CGFloat(min(max(v, 0), 1))))
-            i == 0 ? path.move(to: pt) : path.addLine(to: pt)
+            guard v.isFinite else { flush(); continue }
+            segment.append(CGPoint(x: start + step * CGFloat(i), y: rect.height * (1 - CGFloat(min(max(v, 0), 1)))))
         }
-        if closed {
-            path.addLine(to: CGPoint(x: rect.width, y: rect.height))
-            path.addLine(to: CGPoint(x: start, y: rect.height))
-            path.closeSubpath()
-        }
+        flush()
         return path
     }
 }
@@ -107,11 +122,30 @@ struct MetricTile: View {
     /// For rate series: scale the graph to its own peak, but never below this floor.
     var autoScaleFloor: Double?
     let lines: [String]
+    /// Seconds between graph points, used to show the time of a hovered point.
+    var secondsPerPoint: Double = 1.5
+    /// Formats a raw history value for the hover readout.
+    var format: (Double) -> String = percent
+    /// What was behind each point (e.g. the top app), aligned with `history`.
+    var labels: [String]?
+
+    @State private var hovered: Int?
 
     private var normalized: [Double] {
         guard let floor = autoScaleFloor else { return history }
-        let peak = max(history.max() ?? 0, floor)
+        let peak = max(history.filter(\.isFinite).max() ?? 0, floor)
         return history.map { $0 / peak }
+    }
+
+    /// Hover readout: the time and value of the point under the mouse, then its label if any.
+    private var hoverLines: [String]? {
+        guard let i = hovered, history.indices.contains(i) else { return nil }
+        let secondsAgo = Double(history.count - 1 - i) * secondsPerPoint
+        let when = secondsAgo < 30 ? "Now" : pointTime(Date().addingTimeInterval(-secondsAgo))
+        let value = history[i]
+        guard value.isFinite else { return [when, "No data · Glass Monitor wasn't running"] }
+        let label = labels.flatMap { $0.indices.contains(i) ? $0[i] : nil } ?? ""
+        return ["\(when) · \(format(value))", label.isEmpty ? " " : label]
     }
 
     var body: some View {
@@ -125,14 +159,54 @@ struct MetricTile: View {
                 Sparkline(values: normalized, capacity: capacity).stroke(tint, lineWidth: 1.5)
             }
             .frame(height: 22)
-            ForEach(lines, id: \.self) {
-                Text($0).font(.system(size: 9.5)).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
+            .overlay { hoverLayer }
+            ForEach(Array((hoverLines ?? lines).enumerated()), id: \.offset) { index, line in
+                Text(line).font(.system(size: 9.5, weight: hoverLines != nil && index == 0 ? .semibold : .regular))
+                    .foregroundStyle(hoverLines != nil && index == 0 ? Color.primary : Color.secondary)
+                    .lineLimit(1).minimumScaleFactor(0.7)
             }
         }
         .padding(9)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
+
+    /// Tracks the mouse over the graph (same x mapping as `Sparkline`) and marks the hovered point.
+    private var hoverLayer: some View {
+        GeometryReader { geo in
+            let step = geo.size.width / CGFloat(max(capacity - 1, 1))
+            let start = geo.size.width - step * CGFloat(max(history.count - 1, 0))
+            ZStack(alignment: .topLeading) {
+                Color.clear.contentShape(Rectangle())
+                if let i = hovered {
+                    Rectangle().fill(Color.primary.opacity(0.5))
+                        .frame(width: 1, height: geo.size.height)
+                        .offset(x: start + step * CGFloat(i))
+                }
+            }
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let point) where !history.isEmpty && point.x >= start - step / 2:
+                    hovered = min(max(Int(((point.x - start) / step).rounded()), 0), history.count - 1)
+                default:
+                    hovered = nil
+                }
+            }
+        }
+    }
+}
+
+private let timeFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.timeStyle = .short
+    f.dateStyle = .none
+    return f
+}()
+
+/// "14:32", or "Yesterday 22:10" for points from the previous day.
+func pointTime(_ date: Date) -> String {
+    let time = timeFormatter.string(from: date)
+    return Calendar.current.isDateInToday(date) ? time : "Yesterday \(time)"
 }
 
 struct PillButton: View {

@@ -102,6 +102,27 @@ enum SystemStats {
         return (min(used, total), total, compressed, swap.xsu_used, swap.xsu_total)
     }
 
+    /// This app's total CPU seconds (itself plus finished helper processes such as ps/lsof)
+    /// and its memory footprint (the "Memory" column in Activity Monitor).
+    static func selfUsage() -> (cpuTime: Double, memory: UInt64) {
+        func seconds(_ r: rusage) -> Double {
+            Double(r.ru_utime.tv_sec) + Double(r.ru_utime.tv_usec) / 1e6
+                + Double(r.ru_stime.tv_sec) + Double(r.ru_stime.tv_usec) / 1e6
+        }
+        var me = rusage(), children = rusage()
+        getrusage(RUSAGE_SELF, &me)
+        getrusage(RUSAGE_CHILDREN, &children)
+
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<integer_t>.stride)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return (seconds(me) + seconds(children), result == KERN_SUCCESS ? UInt64(info.phys_footprint) : 0)
+    }
+
     static func memoryPressure() -> MemoryPressure {
         var level: Int32 = 0
         var size = MemoryLayout<Int32>.size

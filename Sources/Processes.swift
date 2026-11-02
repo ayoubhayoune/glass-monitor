@@ -5,6 +5,8 @@ struct RowMetrics {
     var mem: UInt64
     var disk: Double?
     var net: Double?
+    /// macOS "Energy Impact" (the Energy tab of Activity Monitor); only sampled while the Energy tab is open.
+    var energy: Double?
 }
 
 struct ProcInfo: Identifiable {
@@ -16,11 +18,12 @@ struct ProcInfo: Identifiable {
     /// Bytes/s; nil when macOS doesn't let us read it (other users' processes) or on the first sample.
     var diskRate: Double?
     var netRate: Double?
+    var energy: Double?
     let appName: String?
     let bundlePath: String?
 
     var groupKey: String { bundlePath ?? "proc:\(name)" }
-    var metrics: RowMetrics { RowMetrics(cpu: cpu, mem: memBytes, disk: diskRate, net: netRate) }
+    var metrics: RowMetrics { RowMetrics(cpu: cpu, mem: memBytes, disk: diskRate, net: netRate, energy: energy) }
 }
 
 /// All processes belonging to one app bundle (e.g. Chrome and its helpers), or sharing a name.
@@ -37,6 +40,7 @@ struct AppGroup: Identifiable {
             total.mem += p.memBytes
             if let d = p.diskRate { total.disk = (total.disk ?? 0) + d }
             if let n = p.netRate { total.net = (total.net ?? 0) + n }
+            if let e = p.energy { total.energy = (total.energy ?? 0) + e }
         }
     }
 
@@ -68,7 +72,8 @@ enum ProcessList {
         let result = withUnsafeMutablePointer(to: &info) {
             $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) }
         }
-        return result == 0 ? info.ri_diskio_bytesread + info.ri_diskio_byteswritten : nil
+        // Wrapping add: some processes report garbage counters near UInt64.max, and a plain + traps.
+        return result == 0 ? info.ri_diskio_bytesread &+ info.ri_diskio_byteswritten : nil
     }
 }
 
@@ -92,18 +97,29 @@ final class ProcessSampler {
     private var lastDiskTime: Date?
     private var lastNet: [pid_t: UInt64] = [:]
     private var lastNetTime: Date?
+    /// `top` takes a second and real CPU, so energy figures are reused for a few seconds between runs.
+    private var energyCache: (at: Date, values: [pid_t: Double])?
 
-    func sample(network: Bool, completion: @escaping ([ProcInfo]) -> Void) {
+    func sample(network: Bool, energy: Bool, completion: @escaping ([ProcInfo]) -> Void) {
         queue.async {
-            let list = self.collect(network: network)
+            let list = self.collect(network: network, energy: energy)
             DispatchQueue.main.async { completion(list) }
         }
     }
 
-    private func collect(network: Bool) -> [ProcInfo] {
+    private func collect(network: Bool, energy: Bool) -> [ProcInfo] {
         let now = Date()
         let diskInterval = lastDiskTime.map { now.timeIntervalSince($0) }
         let netTotals = network ? nettop() : [:]
+        var energyImpact: [pid_t: Double] = [:]
+        if energy {
+            if let cache = energyCache, now.timeIntervalSince(cache.at) < 6 {
+                energyImpact = cache.values
+            } else {
+                energyImpact = energyImpacts()
+                energyCache = (now, energyImpact)
+            }
+        }
         let netInterval = network ? lastNetTime.map { now.timeIntervalSince($0) } : nil
 
         var disk: [pid_t: UInt64] = [:]
@@ -130,6 +146,7 @@ final class ProcessSampler {
 
             result.append(ProcInfo(id: row.pid, name: row.name, user: row.user, cpu: row.cpu, memBytes: row.mem,
                                    diskRate: diskRate, netRate: netRate,
+                                   energy: energy ? energyImpact[row.pid] ?? 0 : nil,
                                    appName: identity.appName, bundlePath: identity.bundlePath))
         }
 
@@ -155,6 +172,20 @@ final class ProcessSampler {
         }
     }
 
+    /// Per-process energy impact from `top` (the same figure as Activity Monitor). The first `top` sample has no
+    /// rates yet, so take two samples a second apart and read the second table.
+    private func energyImpacts() -> [pid_t: Double] {
+        let output = Shell.run("/usr/bin/top", ["-l", "2", "-s", "1", "-n", "400", "-o", "power", "-stats", "pid,power"]).output
+        guard let table = output.components(separatedBy: "PID").last else { return [:] }
+        var result: [pid_t: Double] = [:]
+        for line in table.split(separator: "\n").dropFirst() {
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 2, let pid = Int32(parts[0]), let power = Double(parts[1]) else { continue }
+            result[pid] = power
+        }
+        return result
+    }
+
     /// Per-process bytes in + out from `nettop`, keyed by pid ("name.pid,in,out," lines).
     private func nettop() -> [pid_t: UInt64] {
         let output = Shell.run("/usr/bin/nettop", ["-P", "-L", "1", "-x", "-J", "bytes_in,bytes_out"]).output
@@ -163,7 +194,7 @@ final class ProcessSampler {
             let columns = line.split(separator: ",", omittingEmptySubsequences: false)
             guard columns.count >= 3, let dot = columns[0].lastIndex(of: "."),
                   let pid = Int32(columns[0][columns[0].index(after: dot)...]) else { continue }
-            totals[pid, default: 0] += (UInt64(columns[1]) ?? 0) + (UInt64(columns[2]) ?? 0)
+            totals[pid, default: 0] &+= (UInt64(columns[1]) ?? 0) &+ (UInt64(columns[2]) ?? 0)
         }
         return totals
     }

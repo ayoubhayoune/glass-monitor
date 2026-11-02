@@ -51,8 +51,14 @@ enum LoginItem {
     /// Earlier builds used SMAppService (the app itself, then a bundled agent); replace them with this agent.
     static func migrate() {
         let legacy = [SMAppService.mainApp, SMAppService.agent(plistName: legacyAgentPlist)]
-        let wasEnabled = legacy.contains { $0.status == .enabled || $0.status == .requiresApproval }
+        // Once the bundle is rebuilt without the bundled agent plist, SMAppService reports that agent as not found,
+        // but launchd still has the job loaded; count that as enabled too, and stop it so it can't relaunch the app.
+        let legacyJob = "\(domain)/\(legacyAgentPlist.replacingOccurrences(of: ".plist", with: ""))"
+        let legacyLoaded = Shell.run("/bin/launchctl", ["print", legacyJob]).status == 0
+        let wasEnabled = legacyLoaded || legacy.contains { $0.status == .enabled || $0.status == .requiresApproval }
         legacy.filter { $0.status != .notRegistered }.forEach { try? $0.unregister() }
+        let launchedByLegacy = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] == legacyJob.components(separatedBy: "/").last
+        if legacyLoaded && !launchedByLegacy { _ = Shell.run("/bin/launchctl", ["bootout", legacyJob]) }
         if wasEnabled && !isEnabled { enable() }
     }
 

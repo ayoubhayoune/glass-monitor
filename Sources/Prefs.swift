@@ -41,7 +41,11 @@ final class Prefs: ObservableObject {
     @Published var hideFromSharing: Bool { didSet { defaults.set(hideFromSharing, forKey: "hideFromSharing") } }
     @Published var hideInFullScreen: Bool { didSet { defaults.set(hideInFullScreen, forKey: "hideInFullScreen") } }
     @Published var alertsEnabled: Bool { didSet { defaults.set(alertsEnabled, forKey: "alertsEnabled") } }
-    @Published var longHistory: Bool { didSet { defaults.set(longHistory, forKey: "longHistory") } }
+    @Published var graphRange: GraphRange { didSet { defaults.set(graphRange.rawValue, forKey: "graphRange") } }
+    /// Collapsed to a small card docked on the right edge of the screen (or wherever it's dragged).
+    @Published var minimized: Bool { didSet { defaults.set(minimized, forKey: "minimized") } }
+    /// The pill is hidden and a menu bar icon brings it back; monitoring and alerts keep running.
+    @Published var hidden: Bool { didSet { defaults.set(hidden, forKey: "hidden") } }
     @Published var groupByApp: Bool { didSet { defaults.set(groupByApp, forKey: "groupByApp") } }
     // Alert thresholds; 0 = off.
     @Published var ramAlert: Double { didSet { defaults.set(ramAlert, forKey: "ramAlert") } }
@@ -57,7 +61,9 @@ final class Prefs: ObservableObject {
         hideFromSharing = defaults.object(forKey: "hideFromSharing") as? Bool ?? true
         hideInFullScreen = defaults.object(forKey: "hideInFullScreen") as? Bool ?? true
         alertsEnabled = defaults.object(forKey: "alertsEnabled") as? Bool ?? true
-        longHistory = defaults.bool(forKey: "longHistory")
+        graphRange = defaults.string(forKey: "graphRange").flatMap(GraphRange.init(rawValue:)) ?? .m30
+        minimized = defaults.bool(forKey: "minimized")
+        hidden = defaults.bool(forKey: "hidden")
         groupByApp = defaults.object(forKey: "groupByApp") as? Bool ?? true
         ramAlert = defaults.object(forKey: "ramAlert") as? Double ?? 0
         swapAlertGB = defaults.object(forKey: "swapAlertGB") as? Double ?? 8

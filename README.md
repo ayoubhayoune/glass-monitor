@@ -18,6 +18,14 @@ add-on.
 - **Opacity** 50–100%, **click-through** mode (hold ⌥ to interact), **hidden in full-screen apps** and
   **hidden from screen sharing and recordings** (both on by default).
 
+- **Minimize to a small card**: the `»` button turns the pill into a rounded card with your readings in a
+  grid. Drag it anywhere, even over the menu bar or the Dock; click it to bring the pill back.
+- **Hide to the menu bar**: the eye button hides the pill and puts a small Glass Monitor icon in the menu bar.
+  Monitoring and alerts keep running; click the icon or press ⌥⌘M to bring it back.
+- **Shut down**: the power button (click twice) closes Glass Monitor and keeps it off, even after a restart,
+  until you open it again from Spotlight.
+- Its own cost is always visible: the panel footer and the right-click menu show Glass Monitor's CPU and memory.
+
 ### Overview
 
 - **Status line**: memory pressure, thermal state (Cool → Throttling), power draw, battery % and
@@ -25,15 +33,23 @@ add-on.
 - **Sensors line**: average CPU and GPU temperature, fan speed ("Fans off" when idle),
   battery health and cycle count (the same figures System Information shows).
 - **Six live graphs**: CPU (user / system), GPU, memory, swap and compressed memory, disk read/write
-  speed and free space, network down/up. Switch between the last minute and the last hour.
+  speed and free space, network down/up. Switch between the last **30 minutes, 2 hours, 12 hours or day**;
+  the graphs survive restarts (time the app wasn't running shows as a gap). **Hover a graph** to see the time and
+  value of any point, and for CPU and memory, which app was on top then.
 
-### Processes (CPU, Memory, Disk, Network tabs)
+### Processes (CPU, Memory, Disk, Network, Energy tabs)
 
 - Top processes ranked by CPU, memory, disk activity or network traffic.
 - **Grouped by app**: all of Chrome's helpers count as one Chrome, with a row you can expand.
   Or list every single process.
 - **Quit, Force Quit** or **kill as admin** (asks for your password) for processes owned by the system.
   Core system processes (kernel_task, WindowServer, launchd, loginwindow) are protected.
+- Network tab: a Wi-Fi strip with signal quality, link speed and IP address.
+
+### Energy
+
+- Apps ranked by **Energy Impact**, the same figure as Activity Monitor's Energy tab.
+- Battery strip: charge, time left, health and cycle count.
 
 ### History
 
@@ -48,7 +64,9 @@ Shown in the pill and as macOS notifications with **Quit** / **Ignore** buttons 
 
 - **Runaway CPU**: a process above 80% CPU for 2 minutes.
 - **Memory leak**: a process that grows by 500 MB and 50% over an hour, rising the whole time.
-- **Critical memory pressure**, with the biggest app named.
+- **Critical memory pressure**, with the biggest app named, and an earlier heads-up when pressure stays at
+  "warning" for 3 minutes (at most once an hour).
+- **Startup disk under 15 GB free** (at most every 6 hours), with a button to the Clean tab.
 - **Your own limits** (right-click → Alert When…): memory %, swap GB, disk %, CPU temperature.
   Each alert fires once and fires again only after the value drops back below the limit.
 
@@ -59,6 +77,7 @@ Shown in the pill and as macOS notifications with **Quit** / **Ignore** buttons 
   project's Docker containers in one click.
 - **Docker**: all containers with their Compose project, CPU and memory; start, stop, restart.
 - **Listening ports**: every local server (Node, PHP, Docker…) with its ports; open in the browser or kill it.
+  Right-click one to free its port, force-kill it, or copy its URL.
 
 ### Clean
 
