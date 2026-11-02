@@ -54,15 +54,11 @@ struct PowerInfo: Equatable {
     let onBattery: Bool
     let charging: Bool
     let percent: Int?
-    /// Minutes until empty (on battery) or full (charging); nil while macOS is still estimating.
-    let minutesRemaining: Int?
-}
-
-/// Battery wear as macOS reports it in System Information.
-struct BatteryHealth: Equatable {
-    let maxCapacity: Int?
-    let cycles: Int?
-    let condition: String?
+    /// macOS's estimate in seconds; nil while it's still calculating or when on power.
+    var timeRemaining: Double?
+    /// Current full-charge capacity as a share of the design capacity.
+    var health: Double?
+    var cycles: Int?
 }
 
 enum SystemStats {
@@ -100,6 +96,27 @@ enum SystemStats {
         var size = MemoryLayout<xsw_usage>.size
         sysctlbyname("vm.swapusage", &swap, &size, nil, 0)
         return (min(used, total), total, compressed, swap.xsu_used, swap.xsu_total)
+    }
+
+    /// This app's total CPU seconds (itself plus finished helper processes such as ps/lsof)
+    /// and its memory footprint (the "Memory" column in Activity Monitor).
+    static func selfUsage() -> (cpuTime: Double, memory: UInt64) {
+        func seconds(_ r: rusage) -> Double {
+            Double(r.ru_utime.tv_sec) + Double(r.ru_utime.tv_usec) / 1e6
+                + Double(r.ru_stime.tv_sec) + Double(r.ru_stime.tv_usec) / 1e6
+        }
+        var me = rusage(), children = rusage()
+        getrusage(RUSAGE_SELF, &me)
+        getrusage(RUSAGE_CHILDREN, &children)
+
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<integer_t>.stride)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return (seconds(me) + seconds(children), result == KERN_SUCCESS ? UInt64(info.phys_footprint) : 0)
     }
 
     static func memoryPressure() -> MemoryPressure {
@@ -174,37 +191,16 @@ enum SystemStats {
         let millivolts = (property(service, "Voltage") as? NSNumber)?.doubleValue ?? 0
         // Amperage is a signed value (negative while discharging) that can surface as a wrapped unsigned number.
         let milliamps = Double((property(service, "InstantAmperage") as? NSNumber)?.int64Value ?? 0)
-        let onBattery = !((property(service, "ExternalConnected") as? Bool) ?? true)
-        let charging = (property(service, "IsCharging") as? Bool) ?? false
-        return PowerInfo(watts: abs(millivolts * milliamps) / 1_000_000, onBattery: onBattery, charging: charging,
+        let maxCapacity = (property(service, "AppleRawMaxCapacity") as? NSNumber)?.doubleValue ?? 0
+        let designCapacity = (property(service, "DesignCapacity") as? NSNumber)?.doubleValue ?? 0
+        let remaining = IOPSGetTimeRemainingEstimate() // -1 unknown, -2 unlimited (on power)
+        return PowerInfo(watts: abs(millivolts * milliamps) / 1_000_000,
+                         onBattery: !((property(service, "ExternalConnected") as? Bool) ?? true),
+                         charging: (property(service, "IsCharging") as? Bool) ?? false,
                          percent: (property(service, "CurrentCapacity") as? NSNumber)?.intValue,
-                         minutesRemaining: minutesRemaining(onBattery: onBattery, charging: charging))
-    }
-
-    /// Time to empty / full from the public power-sources API (-1 while estimating).
-    private static func minutesRemaining(onBattery: Bool, charging: Bool) -> Int? {
-        guard onBattery || charging, let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return nil }
-        let key = onBattery ? kIOPSTimeToEmptyKey : kIOPSTimeToFullChargeKey
-        for source in sources {
-            guard let description = IOPSGetPowerSourceDescription(info, source)?.takeUnretainedValue() as? [String: Any],
-                  description[kIOPSTypeKey] as? String == kIOPSInternalBatteryType else { continue }
-            return (description[key] as? Int).flatMap { $0 > 0 ? $0 : nil }
-        }
-        return nil
-    }
-
-    /// Maximum capacity / cycle count / condition exactly as System Information shows them.
-    /// Slow (≈0.5 s, spawns system_profiler): call off the main thread, rarely.
-    static func batteryHealth() -> BatteryHealth? {
-        let output = Shell.run("/usr/sbin/system_profiler", ["-json", "SPPowerDataType"]).output
-        guard let json = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any],
-              let sections = json["SPPowerDataType"] as? [[String: Any]],
-              let health = sections.compactMap({ $0["sppower_battery_health_info"] as? [String: Any] }).first else { return nil }
-        let capacity = (health["sppower_battery_health_maximum_capacity"] as? String)
-            .flatMap { Int($0.trimmingCharacters(in: CharacterSet(charactersIn: "% "))) }
-        return BatteryHealth(maxCapacity: capacity, cycles: health["sppower_battery_cycle_count"] as? Int,
-                             condition: health["sppower_battery_health"] as? String)
+                         timeRemaining: remaining > 0 ? remaining : nil,
+                         health: maxCapacity > 0 && designCapacity > 0 ? min(maxCapacity / designCapacity, 1) : nil,
+                         cycles: (property(service, "CycleCount") as? NSNumber)?.intValue)
     }
 
     // MARK: IOKit helpers

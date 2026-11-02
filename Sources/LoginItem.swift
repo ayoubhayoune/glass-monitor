@@ -1,59 +1,23 @@
 import AppKit
 import ServiceManagement
 
-/// Starts the app at login through a per-user launch agent (~/Library/LaunchAgents), whose
+/// Starts the app at login through a bundled launch agent (Contents/Library/LaunchAgents), whose
 /// KeepAlive.SuccessfulExit=false makes launchd relaunch it after a crash but not after Quit.
-///
-/// A plain agent with an absolute path is used instead of SMAppService.agent: the bundle is rebuilt in
-/// place by build.sh, and SMAppService then loses track of it (launchd fails every spawn with EX_CONFIG).
 enum LoginItem {
-    static let label = "com.elabidi.glassmonitor.login"
-    private static let legacyAgentPlist = "com.elabidi.glassmonitor.agent.plist"
+    static let label = "com.elabidi.glassmonitor.agent"
+    private static let agent = SMAppService.agent(plistName: "\(label).plist")
 
-    private static var plistURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(label).plist")
-    }
-
-    private static var domain: String { "gui/\(getuid())" }
-
-    static var isEnabled: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
+    static var isEnabled: Bool { agent.status == .enabled }
 
     static func setEnabled(_ on: Bool) {
-        on ? enable() : disable()
+        try? on ? agent.register() : agent.unregister()
     }
 
-    private static func enable() {
-        guard let executable = Bundle.main.executablePath else { return }
-        let plist: [String: Any] = [
-            "Label": label,
-            "ProgramArguments": [executable],
-            "RunAtLoad": true,
-            "KeepAlive": ["SuccessfulExit": false],
-            "LimitLoadToSessionType": "Aqua",
-            "ProcessType": "Interactive",
-        ]
-        try? FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        guard (plist as NSDictionary).write(to: plistURL, atomically: true) else { return }
-        if !isLoaded { _ = Shell.run("/bin/launchctl", ["bootstrap", domain, plistURL.path]) }
-    }
-
-    /// Stops it starting at the next login. A copy launched by the agent keeps its crash protection until
-    /// it quits (booting the job out would kill this very process).
-    private static func disable() {
-        try? FileManager.default.removeItem(at: plistURL)
-        if isLoaded && !launchedByAgent { _ = Shell.run("/bin/launchctl", ["bootout", "\(domain)/\(label)"]) }
-    }
-
-    private static var isLoaded: Bool {
-        Shell.run("/bin/launchctl", ["print", "\(domain)/\(label)"]).status == 0
-    }
-
-    /// Earlier builds used SMAppService (the app itself, then a bundled agent); replace them with this agent.
-    static func migrate() {
-        let legacy = [SMAppService.mainApp, SMAppService.agent(plistName: legacyAgentPlist)]
-        let wasEnabled = legacy.contains { $0.status == .enabled || $0.status == .requiresApproval }
-        legacy.filter { $0.status != .notRegistered }.forEach { try? $0.unregister() }
-        if wasEnabled && !isEnabled { enable() }
+    /// Earlier builds registered the app itself as a login item; replace that with the agent.
+    static func migrateFromMainApp() {
+        guard SMAppService.mainApp.status == .enabled else { return }
+        try? SMAppService.mainApp.unregister()
+        setEnabled(true)
     }
 
     private static var launchedByAgent: Bool {

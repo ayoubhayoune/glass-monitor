@@ -2,7 +2,7 @@ import Foundation
 import Combine
 
 enum PillItem: String, CaseIterable, Identifiable {
-    case cpu, gpu, ram, swap, disk, temp, net
+    case cpu, gpu, ram, swap, disk, net
 
     var id: String { rawValue }
 
@@ -13,7 +13,6 @@ enum PillItem: String, CaseIterable, Identifiable {
         case .ram: "RAM"
         case .swap: "SWAP"
         case .disk: "DISK"
-        case .temp: "TEMP"
         case .net: "NET"
         }
     }
@@ -23,7 +22,7 @@ enum PillItem: String, CaseIterable, Identifiable {
         switch self {
         case .cpu, .gpu: 72
         case .ram: 74
-        case .disk, .temp: 80
+        case .disk: 80
         case .swap: 86
         case .net: 118
         }
@@ -41,13 +40,12 @@ final class Prefs: ObservableObject {
     @Published var hideFromSharing: Bool { didSet { defaults.set(hideFromSharing, forKey: "hideFromSharing") } }
     @Published var hideInFullScreen: Bool { didSet { defaults.set(hideInFullScreen, forKey: "hideInFullScreen") } }
     @Published var alertsEnabled: Bool { didSet { defaults.set(alertsEnabled, forKey: "alertsEnabled") } }
-    @Published var longHistory: Bool { didSet { defaults.set(longHistory, forKey: "longHistory") } }
+    @Published var historyRange: HistoryRange { didSet { defaults.set(historyRange.rawValue, forKey: "historyRange") } }
+    /// Collapsed to a small tab docked on the right edge of the screen.
+    @Published var minimized: Bool { didSet { defaults.set(minimized, forKey: "minimized") } }
+    /// The pill is hidden and a menu bar icon brings it back; monitoring and alerts keep running.
+    @Published var hidden: Bool { didSet { defaults.set(hidden, forKey: "hidden") } }
     @Published var groupByApp: Bool { didSet { defaults.set(groupByApp, forKey: "groupByApp") } }
-    // Alert thresholds; 0 = off.
-    @Published var ramAlert: Double { didSet { defaults.set(ramAlert, forKey: "ramAlert") } }
-    @Published var swapAlertGB: Double { didSet { defaults.set(swapAlertGB, forKey: "swapAlertGB") } }
-    @Published var diskAlert: Double { didSet { defaults.set(diskAlert, forKey: "diskAlert") } }
-    @Published var tempAlert: Double { didSet { defaults.set(tempAlert, forKey: "tempAlert") } }
 
     private init() {
         pillItems = (defaults.stringArray(forKey: "pillItems") ?? ["cpu", "gpu", "ram", "swap", "disk"])
@@ -57,12 +55,10 @@ final class Prefs: ObservableObject {
         hideFromSharing = defaults.object(forKey: "hideFromSharing") as? Bool ?? true
         hideInFullScreen = defaults.object(forKey: "hideInFullScreen") as? Bool ?? true
         alertsEnabled = defaults.object(forKey: "alertsEnabled") as? Bool ?? true
-        longHistory = defaults.bool(forKey: "longHistory")
+        historyRange = defaults.string(forKey: "historyRange").flatMap(HistoryRange.init(rawValue:)) ?? .m30
+        minimized = defaults.bool(forKey: "minimized")
+        hidden = defaults.bool(forKey: "hidden")
         groupByApp = defaults.object(forKey: "groupByApp") as? Bool ?? true
-        ramAlert = defaults.object(forKey: "ramAlert") as? Double ?? 0
-        swapAlertGB = defaults.object(forKey: "swapAlertGB") as? Double ?? 8
-        diskAlert = defaults.object(forKey: "diskAlert") as? Double ?? 0.95
-        tempAlert = defaults.object(forKey: "tempAlert") as? Double ?? 0
     }
 
     /// Adds or removes a pill item, keeping the canonical order and at least one item.

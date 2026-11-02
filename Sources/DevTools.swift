@@ -9,8 +9,6 @@ struct DockerContainer: Identifiable {
     let running: Bool
     let status: String
     let project: String
-    /// Compose project folder, used to match containers to a Laravel project.
-    let workingDir: String
     var cpu = ""
     var memory = ""
 }
@@ -28,15 +26,14 @@ enum Docker {
 
     static func state() -> DockerState {
         guard let binary else { return .unavailable("Docker isn't installed") }
-        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.project.working_dir\"}}"
+        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}\t{{.Label \"com.docker.compose.project\"}}"
         let ps = Shell.run(binary, ["ps", "-a", "--format", format])
         guard ps.status == 0 else { return .unavailable("Docker isn't running") }
 
         var containers = ps.output.split(separator: "\n").compactMap { line -> DockerContainer? in
             let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-            guard f.count >= 7 else { return nil }
-            return DockerContainer(id: f[0], name: f[1], image: f[2], running: f[3] == "running", status: f[4],
-                                   project: f[5], workingDir: f[6])
+            guard f.count >= 6 else { return nil }
+            return DockerContainer(id: f[0], name: f[1], image: f[2], running: f[3] == "running", status: f[4], project: f[5])
         }
 
         if containers.contains(where: \.running) {
@@ -60,140 +57,6 @@ enum Docker {
     static func perform(_ action: String, _ id: String) -> Bool {
         guard let binary else { return false }
         return Shell.run(binary, [action, id]).status == 0
-    }
-}
-
-// MARK: - Laravel projects
-
-struct LaravelProject: Identifiable {
-    let id: String
-    var name: String { (id as NSString).lastPathComponent }
-    /// ERROR or worse in the last 24 hours; `truncated` means only the newest part of a huge log was read.
-    let errors: Int
-    let truncated: Bool
-    let lastError: String?
-    let lastErrorDate: Date?
-    /// The log holding the newest error (or the newest log).
-    let logPath: String?
-
-    func containers(in docker: DockerState) -> [DockerContainer] {
-        guard case .ready(let all) = docker else { return [] }
-        return all.filter { $0.workingDir == id || $0.workingDir.hasPrefix(id + "/") }
-    }
-}
-
-enum Laravel {
-    private static let roots = ["Documents", "Projects", "Developer", "Sites", "code", "dev", "src", "Herd"]
-    /// Tail read per log; enough for a day of a busy app without reading 200 MB logs whole.
-    private static let tailBytes = 4 << 20
-
-    /// Folders containing an `artisan` file.
-    static func projects() -> [String] {
-        let home = NSHomeDirectory()
-        let existing = roots.map { (home as NSString).appendingPathComponent($0) }
-            .filter { FileManager.default.fileExists(atPath: $0) }
-        guard !existing.isEmpty else { return [] }
-        return Shell.run("/usr/bin/find", existing + [
-            "-maxdepth", "6", "(", "-name", "node_modules", "-o", "-name", "vendor", "-o", "-name", ".git",
-            "-o", "-name", "Library", "-o", "-name", "storage", ")", "-prune", "-o", "-type", "f", "-name", "artisan", "-print",
-        ]).output.split(separator: "\n").map { (String($0) as NSString).deletingLastPathComponent }
-    }
-
-    /// Errors logged in the last 24 hours across the project's storage/logs (and per-channel subfolders).
-    static func scan(_ project: String) -> LaravelProject {
-        let folder = URL(fileURLWithPath: project).appendingPathComponent("storage/logs")
-        let since = Date().addingTimeInterval(-86_400)
-        var logs: [(path: String, modified: Date)] = []
-        let enumerator = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])
-        while let url = enumerator?.nextObject() as? URL {
-            if enumerator?.level ?? 0 >= 2 { enumerator?.skipDescendants() }
-            guard url.pathExtension == "log",
-                  let modified = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
-                  modified >= since else { continue }
-            logs.append((url.path, modified))
-        }
-
-        var errors = 0, truncated = false
-        var last: (message: String, date: Date, path: String)?
-        for log in logs {
-            let result = countErrors(in: log.path, since: since)
-            errors += result.count
-            truncated = truncated || result.truncated
-            if let l = result.last, l.date > (last?.date ?? .distantPast) { last = (l.message, l.date, log.path) }
-        }
-        return LaravelProject(id: project, errors: errors, truncated: truncated, lastError: last?.message,
-                              lastErrorDate: last?.date, logPath: last?.path ?? logs.max { $0.modified < $1.modified }?.path)
-    }
-
-    private static func countErrors(in path: String, since: Date) -> (count: Int, truncated: Bool, last: (message: String, date: Date)?) {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return (0, false, nil) }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let start = size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0
-        try? handle.seek(toOffset: start)
-        guard let data = try? handle.readToEnd() else { return (0, false, nil) }
-
-        var count = 0, sawOld = false
-        var last: (String, Date)?
-        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
-            guard let entry = errorEntry(line) else { continue }
-            if entry.date < since { sawOld = true; continue }
-            count += 1
-            last = (entry.message, entry.date)
-        }
-        // Only the newest part was read and nothing in it predates the window: older errors may be missing.
-        return (count, start > 0 && !sawOld && count > 0, last)
-    }
-
-    /// An ERROR-or-worse line in Laravel's line format or a JSON (Monolog / ECS) format; nil for anything else.
-    private static func errorEntry(_ line: Substring) -> (date: Date, message: String)? {
-        if line.hasPrefix("[") {
-            guard let level = lineLevels.first(where: { line.prefix(80).contains($0) }),
-                  let date = timestamp(line), let range = line.range(of: level) else { return nil }
-            return (date, String(line[range.upperBound...].trimmingCharacters(in: .whitespaces).prefix(160)))
-        }
-        guard line.hasPrefix("{"), jsonLevels.contains(where: { line.contains($0) }),
-              let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-              let level = (object["log.level"] ?? object["level_name"]) as? String,
-              errorNames.contains(level.uppercased()),
-              let stamp = (object["@timestamp"] ?? object["datetime"]) as? String,
-              let date = isoFormatter.date(from: stamp) ?? isoFormatterNoFraction.date(from: stamp) else { return nil }
-        return (date, String(((object["message"] as? String) ?? level).prefix(160)))
-    }
-
-    private static let errorNames: Set<String> = ["ERROR", "CRITICAL", "ALERT", "EMERGENCY"]
-    private static let lineLevels = errorNames.map { ".\($0):" }
-    private static let jsonLevels = errorNames.map { "\"\($0)\"" } + errorNames.map { "\"\($0.lowercased())\"" }
-
-    private static let isoFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-    private static let isoFormatterNoFraction = ISO8601DateFormatter()
-
-    private static let formatter: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return f
-    }()
-
-    /// "[2026-10-28 17:40:10]" (Laravel default, app timezone — assumed UTC) or "[2026-10-28T17:40:10.0167+00:00]".
-    private static func timestamp(_ line: Substring) -> Date? {
-        guard line.count > 21 else { return nil }
-        let body = line.dropFirst()
-        let stamp = String(body.prefix(19)).replacingOccurrences(of: "T", with: " ")
-        guard var date = formatter.date(from: stamp) else { return nil }
-        let rest = body.dropFirst(19).prefix { $0 != "]" }
-        if let sign = rest.firstIndex(where: { $0 == "+" || $0 == "-" }) {
-            let parts = rest[rest.index(after: sign)...].split(separator: ":")
-            if parts.count == 2, let h = Double(parts[0]), let m = Double(parts[1]) {
-                date.addTimeInterval((rest[sign] == "+" ? -1 : 1) * (h * 3_600 + m * 60))
-            }
-        }
-        return date
     }
 }
 

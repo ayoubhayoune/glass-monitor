@@ -8,8 +8,8 @@ struct MonitorAlert: Identifiable, Equatable {
     /// Set for runaway-process alerts, which offer Quit / Ignore.
     let pid: pid_t?
     let processName: String?
-    /// Where "Show" leads for alerts without a process.
-    var tab = ListTab.memory
+    /// Other alerts offer a button that opens this tab (memory → Memory, low disk → Clean).
+    var opensTab: ListTab = .memory
 }
 
 /// Flags a process that stays above 80% CPU for 2 minutes. Each process is reported once per busy streak.
@@ -25,7 +25,6 @@ final class RunawayDetector {
     }
 
     func ignore(_ name: String) { ignored.insert(name) }
-    func isIgnored(_ name: String) -> Bool { ignored.contains(name) }
 
     func evaluate(_ processes: [ProcInfo]) -> ProcInfo? {
         let now = Date()
@@ -46,48 +45,6 @@ final class RunawayDetector {
         let live = Set(processes.map(\.id))
         busySince = busySince.filter { live.contains($0.key) }
         reported.formIntersection(live)
-        return found
-    }
-}
-
-/// Flags a process whose memory keeps climbing for an hour: it grows by 500 MB and 50%, and every
-/// 10-minute average is at least the one before. Fed one sample per minute.
-final class LeakDetector {
-    private static let window = 60
-    private static let blocks = 6
-    private static let minGrowth = Double(500 << 20)
-
-    private var series: [pid_t: (name: String, mem: [UInt64])] = [:]
-    /// Memory at the time of reporting; reported again only after dropping 20% below it.
-    private var reported: [pid_t: UInt64] = [:]
-
-    func evaluate(_ processes: [ProcInfo], isIgnored: (String) -> Bool) -> (process: ProcInfo, from: UInt64)? {
-        var found: (ProcInfo, UInt64)?
-        for p in processes {
-            var entry: (name: String, mem: [UInt64]) = series[p.id].flatMap { $0.name == p.name ? $0 : nil } ?? (p.name, [])
-            entry.mem.append(p.memBytes)
-            if entry.mem.count > Self.window { entry.mem.removeFirst() }
-            series[p.id] = entry
-
-            if let at = reported[p.id] {
-                if Double(p.memBytes) < Double(at) * 0.8 { reported[p.id] = nil }
-                continue
-            }
-            guard found == nil, entry.mem.count == Self.window, !isIgnored(p.name), !ProcessList.isProtected(p) else { continue }
-            let size = Self.window / Self.blocks
-            let averages = stride(from: 0, to: Self.window, by: size).map { start in
-                Double(entry.mem[start..<start + size].reduce(0, +)) / Double(size)
-            }
-            guard let first = averages.first, let last = averages.last else { continue }
-            let rising = zip(averages, averages.dropFirst()).allSatisfy { $1 >= $0 * 0.99 }
-            if rising, last - first >= Self.minGrowth, last >= first * 1.5 {
-                reported[p.id] = p.memBytes
-                found = (p, UInt64(first))
-            }
-        }
-        let live = Set(processes.map(\.id))
-        series = series.filter { live.contains($0.key) }
-        reported = reported.filter { live.contains($0.key) }
         return found
     }
 }

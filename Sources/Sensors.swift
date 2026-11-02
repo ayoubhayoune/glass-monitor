@@ -1,141 +1,208 @@
 import Foundation
 import IOKit
+import CoreWLAN
 
-struct SensorReading: Equatable {
-    /// Average of the CPU performance- and efficiency-core sensors, °C.
+struct ThermalInfo: Equatable {
     var cpu: Double?
-    /// Average of the GPU sensors, °C.
     var gpu: Double?
-    /// Fastest fan, rpm (0 = fans idle); nil on fanless Macs.
-    var fanRPM: Double?
-    var fanMaxRPM: Double?
+    /// Current speed of each fan in rpm (empty on fanless Macs).
+    var fans: [Int]
 }
 
-/// Temperatures and fan speeds from the System Management Controller, the same source Stats and
-/// iStat Menus use. macOS has no public API for these: this talks to the AppleSMC IOKit service.
-/// Keys are discovered once (≈0.4 s), then only the relevant ones are read.
-final class SMCSensors {
-    private struct Key {
-        let code: UInt32
-        let size: UInt32
-        let type: UInt32
+/// CPU/GPU temperatures from the Apple Silicon HID temperature sensors. The IOHIDEventSystem API is private,
+/// so it's looked up at runtime: if a macOS update removes it, temperatures just aren't shown.
+final class TemperatureSensors {
+    private typealias Create = @convention(c) (CFAllocator?) -> Unmanaged<AnyObject>?
+    private typealias SetMatching = @convention(c) (AnyObject, CFDictionary) -> Int32
+    private typealias CopyServices = @convention(c) (AnyObject) -> Unmanaged<CFArray>?
+    private typealias CopyProperty = @convention(c) (AnyObject, CFString) -> Unmanaged<AnyObject>?
+    private typealias CopyEvent = @convention(c) (AnyObject, Int64, Int32, Int64) -> Unmanaged<AnyObject>?
+    private typealias GetFloat = @convention(c) (AnyObject, Int32) -> Double
+
+    private static let temperatureEvent: Int64 = 15
+    private static let temperatureField = Int32(15 << 16)
+
+    private var client: AnyObject?
+    private var sensors: [(name: String, service: AnyObject)] = []
+    private var copyEvent: CopyEvent?
+    private var getFloat: GetFloat?
+
+    init() {
+        guard let handle = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY) else { return }
+        func symbol<T>(_ name: String, _: T.Type) -> T? { dlsym(handle, name).map { unsafeBitCast($0, to: T.self) } }
+        guard let create = symbol("IOHIDEventSystemClientCreate", Create.self),
+              let setMatching = symbol("IOHIDEventSystemClientSetMatching", SetMatching.self),
+              let copyServices = symbol("IOHIDEventSystemClientCopyServices", CopyServices.self),
+              let copyProperty = symbol("IOHIDServiceClientCopyProperty", CopyProperty.self),
+              let copyEvent = symbol("IOHIDServiceClientCopyEvent", CopyEvent.self),
+              let getFloat = symbol("IOHIDEventGetFloatValue", GetFloat.self),
+              let client = create(kCFAllocatorDefault)?.takeRetainedValue() else { return }
+        // Usage page 0xff00 / usage 5 = temperature sensors.
+        _ = setMatching(client, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary)
+        let services = (copyServices(client)?.takeRetainedValue() as? [AnyObject]) ?? []
+        sensors = services.compactMap { service in
+            guard let name = copyProperty(service, "Product" as CFString)?.takeRetainedValue() as? String else { return nil }
+            return (name, service)
+        }
+        self.client = client
+        self.copyEvent = copyEvent
+        self.getFloat = getFloat
     }
 
-    /// Mirrors the C `SMCKeyData_t` struct the AppleSMC user client expects (80 bytes).
-    private struct Param {
+    /// CPU = average of the CPU cluster sensors (falls back to the SoC die sensors); GPU = average of the GPU sensors.
+    func read() -> (cpu: Double?, gpu: Double?) {
+        guard let copyEvent, let getFloat else { return (nil, nil) }
+        var clusters: [Double] = [], dies: [Double] = [], gpus: [Double] = []
+        for sensor in sensors {
+            guard let event = copyEvent(sensor.service, Self.temperatureEvent, 0, 0)?.takeRetainedValue() else { continue }
+            let celsius = getFloat(event, Self.temperatureField)
+            guard celsius > 5, celsius < 130 else { continue }
+            let name = sensor.name.lowercased()
+            if name.contains("gpu") { gpus.append(celsius) }
+            else if name.contains("pacc") || name.contains("eacc") { clusters.append(celsius) }
+            else if name.contains("tdie") { dies.append(celsius) }
+        }
+        func average(_ values: [Double]) -> Double? { values.isEmpty ? nil : values.reduce(0, +) / Double(values.count) }
+        return (average(clusters) ?? average(dies), average(gpus))
+    }
+}
+
+/// Read-only access to the System Management Controller, used for fan speeds.
+final class SMC {
+    // Mirrors the kernel's SMCKeyData_t (80 bytes); `padding` reproduces the C alignment after keyInfo.
+    private struct Version { var major: UInt8 = 0, minor: UInt8 = 0, build: UInt8 = 0, reserved: UInt8 = 0, release: UInt16 = 0 }
+    private struct PLimit { var version: UInt16 = 0, length: UInt16 = 0, cpu: UInt32 = 0, gpu: UInt32 = 0, mem: UInt32 = 0 }
+    private struct KeyInfo { var dataSize: UInt32 = 0, dataType: UInt32 = 0, dataAttributes: UInt8 = 0 }
+    private struct Params {
         var key: UInt32 = 0
-        var versMajor: UInt8 = 0, versMinor: UInt8 = 0, versBuild: UInt8 = 0, versReserved: UInt8 = 0
-        var versRelease: UInt16 = 0
-        var pad0: UInt16 = 0
-        var limitVersion: UInt16 = 0, limitLength: UInt16 = 0
-        var cpuLimit: UInt32 = 0, gpuLimit: UInt32 = 0, memLimit: UInt32 = 0
-        var dataSize: UInt32 = 0, dataType: UInt32 = 0
-        var dataAttributes: UInt8 = 0, pad1: UInt8 = 0, pad2: UInt8 = 0, pad3: UInt8 = 0
-        var result: UInt8 = 0, status: UInt8 = 0, command: UInt8 = 0, pad4: UInt8 = 0
-        var index: UInt32 = 0
-        var bytes: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
-    }
-
-    private enum Command: UInt8 {
-        case read = 5, keyAtIndex = 8, keyInfo = 9
+        var version = Version()
+        var pLimit = PLimit()
+        var keyInfo = KeyInfo()
+        var padding: UInt16 = 0
+        var result: UInt8 = 0
+        var status: UInt8 = 0
+        var data8: UInt8 = 0
+        var data32: UInt32 = 0
+        var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     }
 
     private static let handleEvent: UInt32 = 2
-    private static let float = fourCC("flt ")
-    /// CPU cores on Apple Silicon (performance "Tp", efficiency "Te") and Intel ("TC").
-    private static let cpuPrefixes = ["Tp", "Te", "TC0"]
-    private static let gpuPrefixes = ["Tg", "TG0"]
+    private static let readKey: UInt8 = 5
+    private static let readKeyInfo: UInt8 = 9
 
     private var connection: io_connect_t = 0
-    private var cpuKeys: [Key] = []
-    private var gpuKeys: [Key] = []
-    private var fanKeys: [Key] = []
-    /// Doesn't change, so read once.
-    private var fanMaxRPM: Double?
 
-    init() {
+    init?() {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
-        guard service != 0 else { return }
+        guard service != 0 else { return nil }
         defer { IOObjectRelease(service) }
-        guard IOServiceOpen(service, mach_task_self_, 0, &connection) == kIOReturnSuccess else { connection = 0; return }
-        discover()
+        guard MemoryLayout<Params>.size == 80, IOServiceOpen(service, mach_task_self_, 0, &connection) == KERN_SUCCESS
+        else { return nil }
     }
 
-    deinit {
-        if connection != 0 { IOServiceClose(connection) }
+    deinit { IOServiceClose(connection) }
+
+    private static func fourCC(_ s: String) -> UInt32 { s.utf8.reduce(0) { $0 << 8 | UInt32($1) } }
+
+    private func call(_ input: inout Params) -> Params? {
+        var output = Params()
+        var outputSize = MemoryLayout<Params>.stride
+        let result = IOConnectCallStructMethod(connection, Self.handleEvent, &input, MemoryLayout<Params>.stride,
+                                               &output, &outputSize)
+        return result == KERN_SUCCESS && output.result == 0 ? output : nil
     }
 
-    func read() -> SensorReading {
-        guard connection != 0 else { return SensorReading() }
-        let fans = fanKeys.compactMap(value)
-        return SensorReading(cpu: average(cpuKeys), gpu: average(gpuKeys),
-                             fanRPM: fans.isEmpty ? nil : fans.max(), fanMaxRPM: fanMaxRPM)
-    }
-
-    private func discover() {
-        guard let count = info(Self.fourCC("#KEY")).flatMap({ bytes(of: $0) })?.reduce(0, { $0 << 8 | UInt32($1) }) else { return }
-        for index in 0..<count {
-            var input = Param()
-            input.command = Command.keyAtIndex.rawValue
-            input.index = index
-            guard let code = call(&input)?.key, let key = info(code), key.type == Self.float, key.size == 4 else { continue }
-            let name = Self.name(code)
-            if Self.cpuPrefixes.contains(where: name.hasPrefix) {
-                cpuKeys.append(key)
-            } else if Self.gpuPrefixes.contains(where: name.hasPrefix) {
-                gpuKeys.append(key)
-            } else if name.hasPrefix("F"), name.hasSuffix("Ac") {
-                fanKeys.append(key)
-            } else if name.hasPrefix("F"), name.hasSuffix("Mx"), let max = value(key) {
-                fanMaxRPM = Swift.max(fanMaxRPM ?? 0, max)
-            }
+    /// Value of a numeric SMC key, decoding the common Apple Silicon and Intel formats.
+    func value(_ key: String) -> Double? {
+        var input = Params()
+        input.key = Self.fourCC(key)
+        input.data8 = Self.readKeyInfo
+        guard let info = call(&input)?.keyInfo, info.dataSize > 0 else { return nil }
+        input.keyInfo.dataSize = info.dataSize
+        input.data8 = Self.readKey
+        guard let output = call(&input) else { return nil }
+        let b = withUnsafeBytes(of: output.bytes) { Array($0.prefix(Int(min(info.dataSize, 32)))) }
+        switch info.dataType {
+        case Self.fourCC("flt ") where b.count >= 4:
+            let raw = UInt32(b[0]) | UInt32(b[1]) << 8 | UInt32(b[2]) << 16 | UInt32(b[3]) << 24
+            return Double(Float(bitPattern: raw))
+        case Self.fourCC("fpe2") where b.count >= 2: return Double(UInt16(b[0]) << 8 | UInt16(b[1])) / 4
+        case Self.fourCC("ui8 ") where b.count >= 1: return Double(b[0])
+        case Self.fourCC("ui16") where b.count >= 2: return Double(UInt16(b[0]) << 8 | UInt16(b[1]))
+        default: return nil
         }
-        // Drop sensors that aren't wired up on this model (they read 0 or nonsense).
-        cpuKeys = cpuKeys.filter { value($0).map(Self.plausible) ?? false }
-        gpuKeys = gpuKeys.filter { value($0).map(Self.plausible) ?? false }
     }
 
-    private static func plausible(_ celsius: Double) -> Bool { celsius > 5 && celsius < 130 }
+    /// GPU temperature keys across Apple Silicon generations (M1 Pro/Max, M2, M3); missing keys are skipped.
+    private static let gpuKeys = ["Tg05", "Tg0D", "Tg0L", "Tg0T", "Tg0f", "Tg0j", "Tf14", "Tf18", "Tf19", "Tf1A", "Tf24", "Tf28", "Tf29", "Tf2A"]
 
-    private func average(_ keys: [Key]) -> Double? {
-        let values = keys.compactMap(value).filter(Self.plausible)
-        return values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
+    /// Average of the GPU sensors the SMC exposes, for Macs whose HID sensors have no GPU entry.
+    func gpuTemperature() -> Double? {
+        let readings = Self.gpuKeys.compactMap { value($0) }.filter { $0 > 5 && $0 < 130 }
+        return readings.isEmpty ? nil : readings.reduce(0, +) / Double(readings.count)
     }
 
-    private func value(_ key: Key) -> Double? {
-        guard let raw = bytes(of: key), raw.count == 4 else { return nil }
-        return Double(raw.withUnsafeBytes { $0.loadUnaligned(as: Float32.self) })
+    func fanSpeeds() -> [Int] {
+        let count = Int(value("FNum") ?? 0)
+        return (0..<min(count, 4)).compactMap { i in
+            value("F\(i)Ac").flatMap { $0.isFinite && $0 >= 0 && $0 < 20_000 ? Int($0) : nil }
+        }
+    }
+}
+
+struct WiFiInfo: Equatable {
+    /// nil unless the app has Location permission (macOS hides network names otherwise).
+    let ssid: String?
+    let rssi: Int
+    let noise: Int
+    let txRate: Double
+    let ip: String?
+
+    var quality: String {
+        switch rssi {
+        case (-55)...: "Excellent"
+        case -67..<(-55): "Good"
+        case -75..<(-67): "Fair"
+        default: "Weak"
+        }
+    }
+}
+
+enum NetworkInfo {
+    /// Current Wi-Fi link, or nil when Wi-Fi is off or not connected.
+    static func wifi() -> WiFiInfo? {
+        guard let interface = CWWiFiClient.shared().interface(), interface.powerOn() else { return nil }
+        let rssi = interface.rssiValue()
+        guard rssi != 0 else { return nil }
+        return WiFiInfo(ssid: interface.ssid(), rssi: rssi, noise: interface.noiseMeasurement(),
+                        txRate: interface.transmitRate(), ip: ipv4(of: interface.interfaceName ?? "en0"))
     }
 
-    private func info(_ code: UInt32) -> Key? {
-        var input = Param()
-        input.key = code
-        input.command = Command.keyInfo.rawValue
-        guard let output = call(&input) else { return nil }
-        return Key(code: code, size: output.dataSize, type: output.dataType)
+    static func wifiInterfaceName() -> String? { CWWiFiClient.shared().interface()?.interfaceName }
+
+    /// First IPv4 address of a wired "en" interface, for when Wi-Fi isn't the connection.
+    static func wiredIP(excluding wifiInterface: String?) -> String? {
+        addresses().first { $0.name.hasPrefix("en") && $0.name != wifiInterface }?.ip
     }
 
-    private func bytes(of key: Key) -> [UInt8]? {
-        var input = Param()
-        input.key = key.code
-        input.dataSize = key.size
-        input.command = Command.read.rawValue
-        guard let output = call(&input) else { return nil }
-        return withUnsafeBytes(of: output.bytes) { Array($0.prefix(Int(min(key.size, 32)))) }
+    static func ipv4(of name: String) -> String? {
+        addresses().first { $0.name == name }?.ip
     }
 
-    private func call(_ input: inout Param) -> Param? {
-        var output = Param()
-        var size = MemoryLayout<Param>.stride
-        let result = IOConnectCallStructMethod(connection, Self.handleEvent, &input, MemoryLayout<Param>.stride, &output, &size)
-        return result == kIOReturnSuccess && output.result == 0 ? output : nil
-    }
-
-    private static func fourCC(_ text: String) -> UInt32 {
-        text.utf8.reduce(0) { $0 << 8 | UInt32($1) }
-    }
-
-    private static func name(_ code: UInt32) -> String {
-        String(decoding: [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: code >> $0) }, as: UTF8.self)
+    private static func addresses() -> [(name: String, ip: String)] {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return [] }
+        defer { freeifaddrs(head) }
+        var result: [(String, String)] = []
+        for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard let address = entry.pointee.ifa_addr, address.pointee.sa_family == UInt8(AF_INET) else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0
+            else { continue }
+            result.append((String(cString: entry.pointee.ifa_name), String(cString: host)))
+        }
+        return result
     }
 }

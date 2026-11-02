@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 enum Columns {
     static let primary: CGFloat = 72
@@ -12,6 +13,7 @@ extension ListTab {
         case .memory: "MEMORY"
         case .disk: "DISK I/O"
         case .network: "NETWORK"
+        case .energy: "ENERGY"
         default: "CPU"
         }
     }
@@ -23,6 +25,7 @@ extension ListTab {
         case .memory: (bytes(Double(x.mem)), Double(x.mem) / Double(memTotal) * 4)
         case .disk: x.disk.map { (rate($0), $0 / 50_000_000) } ?? ("—", 0)
         case .network: x.net.map { (rate($0), $0 / 5_000_000) } ?? ("—", 0)
+        case .energy: x.energy.map { (String(format: "%.1f", $0), $0 / 50) } ?? ("…", 0)
         default: (String(format: "%.1f%%", x.cpu), x.cpu / 100)
         }
     }
@@ -64,7 +67,8 @@ struct TabBar: View {
                 Button {
                     withAnimation(.smooth(duration: 0.3)) { prefs.groupByApp.toggle() }
                 } label: {
-                    Image(systemName: prefs.groupByApp ? "square.stack.3d.up.fill" : "list.bullet")
+                    Label(prefs.groupByApp ? "Apps" : "Processes",
+                          systemImage: prefs.groupByApp ? "square.stack.3d.up.fill" : "list.bullet")
                         .font(.system(size: 10.5, weight: .medium))
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
@@ -134,6 +138,8 @@ struct ProcessListView: View {
 
     var body: some View {
         VStack(spacing: 4) {
+            if m.tab == .energy { batterySummary }
+            if m.tab == .network { connectionSummary }
             HStack(spacing: 8) {
                 Text(prefs.groupByApp ? "APP" : "PROCESS").frame(maxWidth: .infinity, alignment: .leading)
                 Text(m.tab.primaryTitle).foregroundStyle(.primary).frame(width: Columns.primary, alignment: .trailing)
@@ -155,12 +161,62 @@ struct ProcessListView: View {
             }
             .scrollIndicators(.never)
 
-            if m.tab == .disk || m.tab == .network {
-                Text(m.tab == .disk ? "macOS only reports disk activity for your own processes; others show —"
-                                    : "Per-process traffic measured with nettop")
+            if let note = footnote {
+                Text(note)
                     .font(.system(size: 9.5))
                     .foregroundStyle(.tertiary)
             }
+        }
+    }
+
+    private var footnote: String? {
+        switch m.tab {
+        case .disk: "macOS only reports disk activity for your own processes; others show —"
+        case .network: "Per-process traffic measured with nettop"
+        case .energy: "Energy Impact as reported by macOS, the same figure as Activity Monitor's Energy tab"
+        default: nil
+        }
+    }
+
+    private func summaryStrip(_ symbol: String, _ items: [String]) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: symbol).font(.system(size: 11)).foregroundStyle(.secondary)
+            Text(items.joined(separator: "  ·  ")).font(.system(size: 10.5, weight: .medium)).lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var batterySummary: some View {
+        if let p = m.power {
+            summaryStrip(p.onBattery ? "battery.50percent" : "powerplug.fill", batteryItems(p))
+        } else {
+            summaryStrip("powerplug.fill", ["No battery · energy use per app"])
+        }
+    }
+
+    private func batteryItems(_ p: PowerInfo) -> [String] {
+        var items = [p.percent.map { "\($0)%" } ?? "Battery",
+                     p.onBattery ? String(format: "On battery · %.1f W", p.watts) : (p.charging ? "Charging" : "On power")]
+        if p.onBattery, let t = p.timeRemaining { items.append("\(duration(t)) left") }
+        if let h = p.health { items.append("Health \(percent(h))") }
+        if let c = p.cycles { items.append("\(c) cycles") }
+        return items
+    }
+
+    @ViewBuilder
+    private var connectionSummary: some View {
+        if let w = m.wifi {
+            summaryStrip("wifi", [w.ssid ?? "Wi-Fi", "\(w.quality) signal (\(w.rssi) dBm)",
+                                  String(format: "%.0f Mb/s link", w.txRate), w.ip.map { "IP \($0)" } ?? "No IP"])
+        } else if let ip = m.wiredIP {
+            summaryStrip("cable.connector", ["Wired", "IP \(ip)"])
+        } else {
+            summaryStrip("wifi.slash", ["Not connected"])
         }
     }
 
@@ -236,9 +292,7 @@ struct DevView: View {
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 1) {
-                laravelSection
-
-                SectionTitle("DOCKER CONTAINERS").padding(.top, 6)
+                SectionTitle("DOCKER CONTAINERS")
                 switch m.docker {
                 case .loading:
                     ProgressView().controlSize(.small).padding(8)
@@ -255,63 +309,6 @@ struct DevView: View {
             }
         }
         .scrollIndicators(.never)
-    }
-
-    @ViewBuilder
-    private var laravelSection: some View {
-        HStack {
-            SectionTitle("LARAVEL · ERRORS IN THE LAST 24 H")
-            if m.scanningLaravel { ProgressView().controlSize(.mini) }
-            Button { m.scanLaravel() } label: {
-                Image(systemName: "arrow.clockwise").font(.system(size: 10, weight: .semibold))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .padding(.trailing, 8)
-            .padding(.top, 4)
-            .help("Scan logs again")
-        }
-        if let projects = m.laravel {
-            let failing = projects.filter { $0.errors > 0 }
-            if failing.isEmpty { note(projects.isEmpty ? "No Laravel projects found" : "No errors in \(projects.count) projects") }
-            ForEach(failing.prefix(8)) { laravelRow($0) }
-            if !failing.isEmpty, projects.count > failing.count {
-                note("\(projects.count - failing.count) other projects quiet")
-            }
-        }
-    }
-
-    private func laravelRow(_ p: LaravelProject) -> some View {
-        let containers = p.containers(in: m.docker)
-        let running = containers.filter(\.running).count
-        let icon = Image(systemName: "exclamationmark.triangle.fill")
-            .font(.system(size: 10))
-            .foregroundStyle(.red)
-            .frame(width: 22, height: 22)
-            .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        let when = p.lastErrorDate.map { " · " + $0.formatted(.relative(presentation: .named)) } ?? ""
-        return HoverRow(icon: AnyView(icon), title: p.name, subtitle: (p.lastError ?? "") + when) { hovering in
-            Group {
-                if hovering {
-                    HStack(spacing: 6) {
-                        if running > 0 { PillButton("Restart") { m.restartContainers(p) } }
-                        PillButton("Open Log") { m.openLog(p) }
-                    }
-                } else {
-                    HStack(spacing: 8) {
-                        if !containers.isEmpty {
-                            Text("\(running)/\(containers.count) up").foregroundStyle(.secondary)
-                        }
-                        Text("\(p.errors)\(p.truncated ? "+" : "")")
-                            .font(.system(size: 11, weight: .semibold, design: .rounded))
-                            .foregroundStyle(.red)
-                    }
-                    .font(.system(size: 10.5, design: .rounded)).monospacedDigit()
-                }
-            }
-            .transition(slideIn)
-        }
-        .help(p.lastError ?? p.name)
     }
 
     private func note(_ text: String) -> some View {
@@ -384,6 +381,25 @@ struct DevView: View {
                 }
             }
             .transition(slideIn)
+        }
+        .contextMenu { portMenu(s, key: key) }
+    }
+
+    /// Right-click: free a port that's "already in use" without hunting for the process.
+    @ViewBuilder
+    private func portMenu(_ s: ListeningServer, key: String) -> some View {
+        let ports = s.ports.map { ":\($0)" }.joined(separator: " ")
+        Button("Free \(ports) — Quit \(s.name)") { m.kill(pid: s.id, name: s.name, force: false, key: key) }
+        Button("Force Kill \(s.name)") { m.kill(pid: s.id, name: s.name, force: true, key: key) }
+        Divider()
+        ForEach(s.ports, id: \.self) { port in
+            Button("Open http://localhost:\(port)") { m.open(port: port) }
+        }
+        ForEach(s.ports, id: \.self) { port in
+            Button("Copy http://localhost:\(port)") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString("http://localhost:\(port)", forType: .string)
+            }
         }
     }
 }

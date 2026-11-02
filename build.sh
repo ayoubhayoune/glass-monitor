@@ -4,15 +4,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="$HOME/Applications/Glass Monitor.app"
-# Assemble and sign the bundle in a temporary folder, then move it into place: macOS can refuse
-# writes into a freshly created bundle under ~/Applications.
-STAGE="$(mktemp -d)/Glass Monitor.app"
-trap 'rm -rf "$(dirname "$STAGE")"' EXIT
+pkill -x GlassMonitor 2>/dev/null || true
 
-mkdir -p "$STAGE/Contents/MacOS"
-swiftc -O -swift-version 5 -target arm64-apple-macos26.0 Sources/*.swift -o "$STAGE/Contents/MacOS/GlassMonitor"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS"
+swiftc -O -swift-version 5 -target arm64-apple-macos26.0 Sources/*.swift -o "$APP/Contents/MacOS/GlassMonitor"
 
-cat > "$STAGE/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -20,6 +18,7 @@ cat > "$STAGE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key><string>Glass Monitor</string>
     <key>CFBundleIdentifier</key><string>com.elabidi.glassmonitor</string>
     <key>CFBundleExecutable</key><string>GlassMonitor</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>
@@ -29,13 +28,28 @@ cat > "$STAGE/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - "$STAGE"
+# App icon (Spotlight, Finder, Login Items). Regenerate with: swift Icon/make-icon.swift Icon/AppIcon.icns
+mkdir -p "$APP/Contents/Resources"
+cp Icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
-pkill -x GlassMonitor 2>/dev/null || true
-mkdir -p "$(dirname "$APP")"
-rm -rf "$APP"
-mv "$STAGE" "$APP"
-# With "Open at Login" on, restart through the login agent so crash auto-restart stays active.
-LOGIN="gui/$(id -u)/com.elabidi.glassmonitor.login"
-if launchctl print "$LOGIN" >/dev/null 2>&1; then launchctl kickstart -k "$LOGIN"; else open "$APP"; fi
+# Login + crash-restart agent, registered by the app via SMAppService.agent.
+mkdir -p "$APP/Contents/Library/LaunchAgents"
+cat > "$APP/Contents/Library/LaunchAgents/com.elabidi.glassmonitor.agent.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.elabidi.glassmonitor.agent</string>
+    <key>BundleProgram</key><string>Contents/MacOS/GlassMonitor</string>
+    <key>AssociatedBundleIdentifiers</key><array><string>com.elabidi.glassmonitor</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>LimitLoadToSessionType</key><string>Aqua</string>
+    <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
+PLIST
+
+codesign --force --sign - "$APP"
+open "$APP"
 echo "Installed and launched: $APP"
